@@ -23,6 +23,17 @@
   };
   var HOTLINE = '400-6-020-510';
   var HOTLINE_TEL = 'tel:4006020510';
+
+  /* ======== ★ 实时人工通道（自建中转服务） ★ ========
+     填入后端地址后，「转人工」将不再跳出网页——访客直接在本窗口
+     与您对话，消息实时推送到接待人员的企微 App，回复实时回显。
+     api   = 中转服务地址（如 https://kf-api.你的域名.com）
+     token = 与后端 config.py 的 VISITOR_TOKEN 一致（防滥用，可留空）
+     未填写时「转人工」自动降级为「微信客服链接」模式。 */
+  var LIVE_KEFU = {
+    api: '',
+    token: ''
+  };
   /* ==================================================== */
 
   if (document.getElementById('kfFab')) return; // 防重复注入
@@ -131,7 +142,112 @@
   ];
   var HUMAN_INTENT = /人工|客服|真人|找人来|转接|咨询顾问/;
 
+  /* ---------- 5.5 实时人工通道（网页内对话 ↔ 接待人员企微 App） ---------- */
+  var live = { on: false, sid: '', seq: 0, timer: 0, errShown: false };
+
+  function liveSid() {
+    if (!live.sid) {
+      var chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789', s = '';
+      for (var i = 0; i < 4; i++) s += chars[Math.floor(Math.random() * chars.length)];
+      try { s = sessionStorage.getItem('kfSid') || s; sessionStorage.setItem('kfSid', s); } catch (e) {}
+      live.sid = s;
+    }
+    return live.sid;
+  }
+
+  function liveHeaders() {
+    var h = { 'Content-Type': 'application/json' };
+    if (LIVE_KEFU.token) h['X-KF-Token'] = LIVE_KEFU.token;
+    return h;
+  }
+
+  function addStaffMsg(text) {
+    var div = document.createElement('div');
+    div.className = 'kf-msg kf-msg--bot kf-msg--staff';
+    div.innerHTML = '<span class="kf-staff-tag">顾问</span>' + text.replace(/</g, '&lt;').replace(/\n/g, '<br/>');
+    body.appendChild(div);
+    scrollBottom();
+  }
+
+  function liveSysMsg(html) {
+    var div = document.createElement('div');
+    div.className = 'kf-msg kf-msg--sys';
+    div.innerHTML = html;
+    body.appendChild(div);
+    scrollBottom();
+  }
+
+  function startLive() {
+    live.on = true;
+    panel.classList.add('is-live');
+    var sub = panel.querySelector('.kf-head__sub');
+    if (sub) sub.innerHTML = '<i></i>人工咨询中 · 顾问将在企微端回复';
+    var btn = document.getElementById('kfHuman');
+    if (btn) { btn.textContent = '人工中'; btn.disabled = true; }
+    input.placeholder = '请留言，顾问会尽快回复…';
+
+    liveSysMsg('已接通<strong>人工咨询通道</strong>（编号 #' + liveSid() + '）<br/>您在下方发送的内容将实时送达顾问的企业微信，顾问回复后会直接显示在本窗口。<br/>服务时间：工作日 9:00–18:00');
+
+    // 首次拉取（访客刷新页面后可继续收到回复）
+    pollLive();
+    live.timer = setInterval(pollLive, 3500);
+  }
+
+  function stopLiveTimers() {
+    if (live.timer) { clearInterval(live.timer); live.timer = 0; }
+  }
+
+  function pollLive() {
+    fetch(LIVE_KEFU.api + '/api/visitor/poll?sid=' + encodeURIComponent(liveSid()) + '&after=' + live.seq, { headers: liveHeaders() })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (d) {
+        if (!d || !d.ok || !d.replies || !d.replies.length) return;
+        d.replies.forEach(function (r) {
+          if (r.seq > live.seq) {
+            live.seq = r.seq;
+            addStaffMsg(r.text);
+          }
+        });
+      })
+      .catch(function () {
+        if (!live.errShown) {
+          live.errShown = true;
+          liveSysMsg('网络波动，正在重连…');
+        }
+      });
+  }
+
+  function sendLive(text) {
+    addMsg(text.replace(/</g, '&lt;'), 'user');
+    var t = addTyping();
+    fetch(LIVE_KEFU.api + '/api/visitor/send', {
+      method: 'POST',
+      headers: liveHeaders(),
+      body: JSON.stringify({ sid: liveSid(), text: text })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        t.remove();
+        if (d && d.ok) {
+          if (!d.delivered) liveSysMsg('消息已记录，但顾问通道暂时离线（稍后自动重试推送）');
+        } else {
+          liveSysMsg('发送失败，请稍后重试或拨打 ' + HOTLINE);
+        }
+      })
+      .catch(function () {
+        t.remove();
+        liveSysMsg('网络异常，请稍后重试或拨打 ' + HOTLINE);
+      });
+  }
+
   function goHuman() {
+    /* 优先：实时人工通道（网页内直接对话，不跳出网页） */
+    if (LIVE_KEFU.api) {
+      if (!live.on) startLive();
+      input.focus();
+      return;
+    }
+    /* 降级：微信客服链接（跳转/扫码） */
     botReply('正在为您接入<strong>企业微信人工客服</strong>…', 500);
     setTimeout(function () {
       if (WECHAT_KEFU.url) {
@@ -161,6 +277,8 @@
   function ask(text) {
     addMsg(text.replace(/</g, '&lt;'), 'user');
     if (HUMAN_INTENT.test(text)) { goHuman(); return; }
+    /* 实时人工模式下：所有消息直接转发给顾问，不再走本地规则 */
+    if (live.on) { sendLive(text); return; }
     for (var i = 0; i < RULES.length; i++) {
       if (RULES[i].k.test(text)) { botReply(RULES[i].a); return; }
     }
@@ -195,11 +313,13 @@
       }, 1400);
     }
     setTimeout(function () { try { input.focus({ preventScroll: true }); } catch (e) {} }, 350);
+    if (live.on && !live.timer) live.timer = setInterval(pollLive, 3500); // 重新打开恢复轮询
   }
   function closePanel() {
     panel.classList.remove('is-open');
     panel.setAttribute('aria-hidden', 'true');
     fabBtn.classList.remove('is-active');
+    if (live.on) stopLiveTimers(); // 关闭面板暂停轮询，访客的回复仍在服务端排队
   }
   fabBtn.addEventListener('click', function () {
     panel.classList.contains('is-open') ? closePanel() : openPanel();
